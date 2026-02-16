@@ -357,14 +357,14 @@ fn run_phase_lifecycle(
         PhaseAction::PlanAndExecute => {
             log_to_file(
                 log_file,
-                &format!("Phase {}: Starting plan-phase --auto", phase_display),
+                &format!("Phase {}: Starting plan-phase", phase_display),
             );
 
-            let prompt = format!("/gsd:plan-phase {} --auto", phase_display);
+            let prompt = format!("/gsd:plan-phase {}", phase_display);
             if !run_claude(&prompt, project, log_file) {
                 log_to_file(
                     log_file,
-                    &format!("Phase {}: plan-phase --auto failed", phase_display),
+                    &format!("Phase {}: plan-phase failed", phase_display),
                 );
                 return PhaseOutcome::ExecutionFailed;
             }
@@ -372,14 +372,14 @@ fn run_phase_lifecycle(
         PhaseAction::Execute => {
             log_to_file(
                 log_file,
-                &format!("Phase {}: Starting execute-phase --auto", phase_display),
+                &format!("Phase {}: Starting execute-phase", phase_display),
             );
 
-            let prompt = format!("/gsd:execute-phase {} --auto", phase_display);
+            let prompt = format!("/gsd:execute-phase {}", phase_display);
             if !run_claude(&prompt, project, log_file) {
                 log_to_file(
                     log_file,
-                    &format!("Phase {}: execute-phase --auto failed", phase_display),
+                    &format!("Phase {}: execute-phase failed", phase_display),
                 );
                 return PhaseOutcome::ExecutionFailed;
             }
