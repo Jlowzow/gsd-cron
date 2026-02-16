@@ -51,12 +51,14 @@ fn write_crontab(content: &str) -> Result<(), String> {
 
 /// Install a single dispatcher crontab entry for a project.
 /// Replaces any existing entries for this project with a single `gsd-cron run` entry.
+/// Sources `~/.config/gsd-cron/env` if it exists (for ANTHROPIC_API_KEY).
 pub fn install_dispatcher(
     project_path: &Path,
     binary_path: &Path,
     max_parallel: usize,
     interval_minutes: u32,
     window: Option<&str>,
+    weekly_budget: Option<f64>,
 ) -> Result<(), String> {
     let current = read_crontab()?;
     let cleaned = remove_project_entries(&current, project_path);
@@ -76,11 +78,19 @@ pub fn install_dispatcher(
         None => String::new(),
     };
 
+    let budget_arg = match weekly_budget {
+        Some(b) => format!(" --weekly-budget {:.2}", b),
+        None => String::new(),
+    };
+
+    // Source env file if it exists, then run gsd-cron either way
+    let env_source = "test -f ~/.config/gsd-cron/env && . ~/.config/gsd-cron/env;";
+
     let mut lines = Vec::new();
     lines.push(format!("{}{}", TAG_PREFIX, project_str));
     lines.push(format!(
-        "{} {} run --project {} --max-parallel {}{} >> {} 2>&1 # gsd-cron:{}",
-        cron_schedule, binary_str, project_str, max_parallel, window_arg, log_file.display(), project_str
+        "{} {} {} run --project {} --max-parallel {}{}{} >> {} 2>&1 # gsd-cron:{}",
+        cron_schedule, env_source, binary_str, project_str, max_parallel, window_arg, budget_arg, log_file.display(), project_str
     ));
     lines.push(format!("{}{} END", TAG_PREFIX, project_str));
 

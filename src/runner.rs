@@ -1,7 +1,8 @@
 use crate::parser::{
     self, Phase, PhaseNumber, PhaseSchedulability, PhaseStatus,
 };
-use chrono::NaiveTime;
+use chrono::{Datelike, NaiveTime};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -20,6 +21,24 @@ pub enum PhaseOutcome {
     Verified,
     VerificationFailed,
     ExecutionFailed,
+}
+
+pub struct ClaudeResult {
+    pub success: bool,
+    pub cost_usd: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UsageLedger {
+    pub entries: Vec<UsageEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UsageEntry {
+    pub date: String,
+    pub phase: String,
+    pub action: String,
+    pub cost_usd: f64,
 }
 
 pub struct LockGuard {
@@ -115,8 +134,74 @@ pub fn is_within_window(window: Option<&str>) -> bool {
     }
 }
 
+/// Read the usage ledger from `.planning/logs/usage.json`.
+pub fn read_ledger(project: &Path) -> UsageLedger {
+    let path = project.join(".planning").join("logs").join("usage.json");
+    match fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or(UsageLedger { entries: vec![] }),
+        Err(_) => UsageLedger { entries: vec![] },
+    }
+}
+
+/// Write the usage ledger to `.planning/logs/usage.json`.
+pub fn write_ledger(project: &Path, ledger: &UsageLedger) {
+    let logs_dir = project.join(".planning").join("logs");
+    fs::create_dir_all(&logs_dir).ok();
+    let path = logs_dir.join("usage.json");
+    if let Ok(json) = serde_json::to_string_pretty(ledger) {
+        fs::write(&path, json).ok();
+    }
+}
+
+/// Append a cost entry to the usage ledger.
+fn record_cost(project: &Path, phase: &str, action: &str, cost_usd: f64) {
+    let mut ledger = read_ledger(project);
+    ledger.entries.push(UsageEntry {
+        date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        phase: phase.to_string(),
+        action: action.to_string(),
+        cost_usd,
+    });
+    write_ledger(project, &ledger);
+}
+
+/// Sum costs from the current ISO week (Monday–Sunday).
+pub fn weekly_spend(ledger: &UsageLedger) -> f64 {
+    let today = chrono::Local::now().date_naive();
+    let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+    let sunday = monday + chrono::Duration::days(6);
+
+    ledger
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let d = chrono::NaiveDate::parse_from_str(&e.date, "%Y-%m-%d").ok()?;
+            if d >= monday && d <= sunday {
+                Some(e.cost_usd)
+            } else {
+                None
+            }
+        })
+        .sum()
+}
+
+/// Check if weekly budget is exhausted. Returns true if over budget.
+fn is_budget_exhausted(project: &Path, budget: f64) -> bool {
+    let ledger = read_ledger(project);
+    let spent = weekly_spend(&ledger);
+    if spent >= budget {
+        eprintln!(
+            "Weekly budget of ${:.2} exhausted (${:.2} spent). Skipping.",
+            budget, spent
+        );
+        return true;
+    }
+    eprintln!("Weekly spend: ${:.2} / ${:.2} budget", spent, budget);
+    false
+}
+
 /// Main dispatcher run loop.
-pub fn run(project: &Path, max_parallel: usize, window: Option<&str>) {
+pub fn run(project: &Path, max_parallel: usize, window: Option<&str>, weekly_budget: Option<f64>) {
     if !is_within_window(window) {
         eprintln!(
             "Outside running window ({}). Skipping.",
@@ -124,6 +209,13 @@ pub fn run(project: &Path, max_parallel: usize, window: Option<&str>) {
         );
         return;
     }
+
+    if let Some(budget) = weekly_budget {
+        if is_budget_exhausted(project, budget) {
+            return;
+        }
+    }
+
     let _lock = match acquire_lock(project) {
         Some(l) => l,
         None => {
@@ -137,6 +229,13 @@ pub fn run(project: &Path, max_parallel: usize, window: Option<&str>) {
     fs::create_dir_all(&logs_dir).ok();
 
     loop {
+        // Check budget before each batch
+        if let Some(budget) = weekly_budget {
+            if is_budget_exhausted(project, budget) {
+                break;
+            }
+        }
+
         // Re-read ROADMAP.md and phase dirs each iteration
         let roadmap_path = planning_dir.join("ROADMAP.md");
         let roadmap_content = match fs::read_to_string(&roadmap_path) {
@@ -361,7 +460,9 @@ fn run_phase_lifecycle(
             );
 
             let prompt = format!("/gsd:plan-phase {}", phase_display);
-            if !run_claude(&prompt, project, log_file) {
+            let result = run_claude(&prompt, project, log_file);
+            record_cost(project, &phase_display, "plan", result.cost_usd);
+            if !result.success {
                 log_to_file(
                     log_file,
                     &format!("Phase {}: plan-phase failed", phase_display),
@@ -376,7 +477,9 @@ fn run_phase_lifecycle(
             );
 
             let prompt = format!("/gsd:execute-phase {}", phase_display);
-            if !run_claude(&prompt, project, log_file) {
+            let result = run_claude(&prompt, project, log_file);
+            record_cost(project, &phase_display, "execute", result.cost_usd);
+            if !result.success {
                 log_to_file(
                     log_file,
                     &format!("Phase {}: execute-phase failed", phase_display),
@@ -393,7 +496,9 @@ fn run_phase_lifecycle(
     );
 
     let verify_prompt = format!("/gsd:verify-work {}", phase_display);
-    if !run_claude(&verify_prompt, project, log_file) {
+    let verify_result = run_claude(&verify_prompt, project, log_file);
+    record_cost(project, &phase_display, "verify", verify_result.cost_usd);
+    if !verify_result.success {
         log_to_file(
             log_file,
             &format!("Phase {}: verification command failed", phase_display),
@@ -423,26 +528,56 @@ fn run_phase_lifecycle(
     PhaseOutcome::VerificationFailed
 }
 
+/// Parse `total_cost_usd` from Claude's JSON output.
+/// Looks for a line containing `{"type":"result",...}` and extracts the cost.
+fn parse_cost_from_output(stdout: &str) -> f64 {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if val.get("type").and_then(|t| t.as_str()) == Some("result") {
+                if let Some(cost) = val.get("total_cost_usd").and_then(|c| c.as_f64()) {
+                    return cost;
+                }
+            }
+        }
+    }
+    0.0
+}
+
 /// Run claude CLI with the given prompt and project, appending output to log file.
-fn run_claude(prompt: &str, project: &Path, log_file: &Path) -> bool {
+/// Returns a ClaudeResult with success status and cost extracted from JSON output.
+fn run_claude(prompt: &str, project: &Path, log_file: &Path) -> ClaudeResult {
     let project_str = project.display().to_string();
 
     log_to_file(
         log_file,
         &format!(
-            "Running: claude --dangerously-skip-permissions -p '{}' {}",
+            "Running: claude --dangerously-skip-permissions --output-format json -p '{}' {}",
             prompt, project_str
         ),
     );
 
     let result = Command::new("claude")
-        .args(["--dangerously-skip-permissions", "-p", prompt, &project_str])
+        .args([
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "json",
+            "-p",
+            prompt,
+            &project_str,
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output();
 
     match result {
         Ok(output) => {
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let cost_usd = parse_cost_from_output(&stdout_str);
+
             // Append stdout and stderr to log file
             if let Ok(mut file) = fs::OpenOptions::new()
                 .create(true)
@@ -452,11 +587,17 @@ fn run_claude(prompt: &str, project: &Path, log_file: &Path) -> bool {
                 file.write_all(&output.stdout).ok();
                 file.write_all(&output.stderr).ok();
             }
-            output.status.success()
+            ClaudeResult {
+                success: output.status.success(),
+                cost_usd,
+            }
         }
         Err(e) => {
             log_to_file(log_file, &format!("Failed to run claude: {}", e));
-            false
+            ClaudeResult {
+                success: false,
+                cost_usd: 0.0,
+            }
         }
     }
 }
@@ -795,5 +936,88 @@ mod tests {
         // 05:00 exactly is outside 23:00-05:00 (end is exclusive)
         let t = NaiveTime::from_hms_opt(5, 0, 0).unwrap();
         assert!(!time_in_window(t, "23:00-05:00"));
+    }
+
+    // --- Cost parsing tests ---
+
+    #[test]
+    fn test_parse_cost_from_output_valid() {
+        let output = r#"{"type":"result","subtype":"success","total_cost_usd":0.42,"session_id":"abc123"}"#;
+        assert!((parse_cost_from_output(output) - 0.42).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_cost_from_output_no_result() {
+        let output = "some random text\nno json here\n";
+        assert!(parse_cost_from_output(output).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_cost_from_output_mixed_lines() {
+        let output = r#"some log output
+{"type":"assistant","message":"hello"}
+{"type":"result","subtype":"success","total_cost_usd":1.23,"session_id":"xyz"}"#;
+        assert!((parse_cost_from_output(output) - 1.23).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_cost_from_output_no_cost_field() {
+        let output = r#"{"type":"result","subtype":"success","session_id":"abc"}"#;
+        assert!(parse_cost_from_output(output).abs() < 0.001);
+    }
+
+    // --- Ledger / budget tests ---
+
+    #[test]
+    fn test_weekly_spend_current_week() {
+        let today = chrono::Local::now().date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let ledger = UsageLedger {
+            entries: vec![
+                UsageEntry { date: today_str.clone(), phase: "1".into(), action: "plan".into(), cost_usd: 0.15 },
+                UsageEntry { date: today_str, phase: "1".into(), action: "execute".into(), cost_usd: 0.30 },
+            ],
+        };
+        assert!((weekly_spend(&ledger) - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_weekly_spend_excludes_old_entries() {
+        let old_date = (chrono::Local::now().date_naive() - chrono::Duration::days(30))
+            .format("%Y-%m-%d").to_string();
+        let today_str = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let ledger = UsageLedger {
+            entries: vec![
+                UsageEntry { date: old_date, phase: "1".into(), action: "plan".into(), cost_usd: 10.00 },
+                UsageEntry { date: today_str, phase: "2".into(), action: "execute".into(), cost_usd: 0.50 },
+            ],
+        };
+        assert!((weekly_spend(&ledger) - 0.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_weekly_spend_empty_ledger() {
+        let ledger = UsageLedger { entries: vec![] };
+        assert!(weekly_spend(&ledger).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ledger_roundtrip() {
+        let dir = std::env::temp_dir().join("gsd-cron-test-ledger");
+        let project = dir.clone();
+        fs::create_dir_all(project.join(".planning").join("logs")).ok();
+
+        let ledger = UsageLedger {
+            entries: vec![UsageEntry {
+                date: "2026-02-16".into(), phase: "1".into(), action: "plan".into(), cost_usd: 0.25,
+            }],
+        };
+
+        write_ledger(&project, &ledger);
+        let loaded = read_ledger(&project);
+        assert_eq!(loaded.entries.len(), 1);
+        assert!((loaded.entries[0].cost_usd - 0.25).abs() < 0.001);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

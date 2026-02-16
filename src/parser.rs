@@ -1,5 +1,4 @@
 use regex::Regex;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,8 +24,10 @@ pub enum PhaseSchedulability {
 pub struct Phase {
     pub number: PhaseNumber,
     pub name: String,
+    #[allow(dead_code)]
     pub plans_complete: (u32, u32),
     pub status: PhaseStatus,
+    #[allow(dead_code)]
     pub completed_date: Option<String>,
     pub schedulability: PhaseSchedulability,
     pub dir_path: Option<PathBuf>,
@@ -73,36 +74,6 @@ impl std::fmt::Display for PhaseNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.display())
     }
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ProjectConfig {
-    #[serde(default)]
-    pub mode: Option<String>,
-    #[serde(default)]
-    pub parallelization: Option<ParallelizationConfig>,
-    #[serde(default)]
-    pub git: Option<GitConfig>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ParallelizationConfig {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub max_concurrent_agents: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct GitConfig {
-    #[serde(default)]
-    pub branching_strategy: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct StateInfo {
-    pub current_phase: Option<String>,
-    pub status: Option<String>,
 }
 
 #[derive(Debug)]
@@ -216,27 +187,6 @@ fn extract_embedded_date(s: &str) -> Option<String> {
 fn is_date(s: &str) -> bool {
     let re = Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap();
     re.is_match(s)
-}
-
-pub fn parse_config(path: &Path) -> ProjectConfig {
-    match fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => ProjectConfig::default(),
-    }
-}
-
-pub fn parse_state(content: &str) -> StateInfo {
-    let phase_re = Regex::new(r"(?m)^Phase:\s*(.+)$").unwrap();
-    let status_re = Regex::new(r"(?m)^Status:\s*(.+)$").unwrap();
-
-    StateInfo {
-        current_phase: phase_re
-            .captures(content)
-            .map(|c| c[1].trim().to_string()),
-        status: status_re
-            .captures(content)
-            .map(|c| c[1].trim().to_string()),
-    }
 }
 
 pub fn parse_verification(content: &str) -> Option<VerificationInfo> {
@@ -621,35 +571,4 @@ score: 3/5 must-haves verified
         assert_eq!(info.status, "gaps_found");
     }
 
-    #[test]
-    fn test_parse_state() {
-        let content = r#"# Project State
-
-## Current Position
-Phase: 3 of 5 (API Layer)
-Plan: 1 of 2 in current phase
-Status: In progress
-Last activity: 2026-01-20 — Completed auth system
-"#;
-        let state = parse_state(content);
-        assert_eq!(state.current_phase, Some("3 of 5 (API Layer)".to_string()));
-        assert_eq!(state.status, Some("In progress".to_string()));
-    }
-
-    #[test]
-    fn test_parse_config() {
-        let tmp = std::env::temp_dir().join("test_gsd_config.json");
-        fs::write(&tmp, r#"{
-            "mode": "interactive",
-            "parallelization": { "enabled": true, "max_concurrent_agents": 3 },
-            "git": { "branching_strategy": "phase" }
-        }"#).unwrap();
-
-        let config = parse_config(&tmp);
-        assert_eq!(config.mode, Some("interactive".to_string()));
-        assert_eq!(config.parallelization.unwrap().enabled, Some(true));
-        assert_eq!(config.git.unwrap().branching_strategy, Some("phase".to_string()));
-
-        fs::remove_file(&tmp).ok();
-    }
 }
