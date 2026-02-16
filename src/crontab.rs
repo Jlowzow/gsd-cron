@@ -1,48 +1,7 @@
-use crate::scheduler::ScheduleSlot;
 use std::path::Path;
 use std::process::Command;
 
 const TAG_PREFIX: &str = "# gsd-cron:";
-
-/// Generate crontab entry lines for a schedule.
-/// Each entry runs the wrapper script with the phase number as argument.
-pub fn generate_entries(
-    slots: &[ScheduleSlot],
-    project_path: &Path,
-    wrapper_path: &Path,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    let project_str = project_path.display().to_string();
-    let wrapper_str = wrapper_path.display().to_string();
-
-    lines.push(format!("{}{}", TAG_PREFIX, project_str));
-
-    for slot in slots {
-        let minute = slot.time.format("%M").to_string();
-        let hour = slot.time.format("%H").to_string();
-        // Remove leading zeros for cron compatibility
-        let minute = minute.trim_start_matches('0');
-        let minute = if minute.is_empty() { "0" } else { minute };
-        let hour = hour.trim_start_matches('0');
-        let hour = if hour.is_empty() { "0" } else { hour };
-
-        for phase in &slot.phases {
-            let phase_display = phase.number.display();
-            lines.push(format!(
-                "{} {} * * * {} {} # gsd-cron:{} phase {}",
-                minute,
-                hour,
-                wrapper_str,
-                phase_display,
-                project_str,
-                phase_display,
-            ));
-        }
-    }
-
-    lines.push(format!("{}{} END", TAG_PREFIX, project_str));
-    lines
-}
 
 /// Read the current user crontab
 pub fn read_crontab() -> Result<String, String> {
@@ -54,7 +13,6 @@ pub fn read_crontab() -> Result<String, String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
-        // Empty crontab returns non-zero on some systems
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("no crontab") {
             Ok(String::new())
@@ -91,24 +49,68 @@ fn write_crontab(content: &str) -> Result<(), String> {
     }
 }
 
-/// Install crontab entries for a project (removes existing entries for the project first)
-pub fn install(
-    slots: &[ScheduleSlot],
+/// Install a single dispatcher crontab entry for a project.
+/// Replaces any existing entries for this project with a single `gsd-cron run` entry.
+pub fn install_dispatcher(
     project_path: &Path,
-    wrapper_path: &Path,
+    binary_path: &Path,
+    max_parallel: usize,
+    interval_minutes: u32,
+    window: Option<&str>,
 ) -> Result<(), String> {
     let current = read_crontab()?;
     let cleaned = remove_project_entries(&current, project_path);
-    let new_entries = generate_entries(slots, project_path, wrapper_path);
+
+    let project_str = project_path.display().to_string();
+    let binary_str = binary_path.display().to_string();
+    let log_file = project_path
+        .join(".planning")
+        .join("logs")
+        .join("dispatcher.log");
+
+    // Build cron schedule from interval
+    let cron_schedule = interval_to_cron(interval_minutes);
+
+    let window_arg = match window {
+        Some(w) => format!(" --window {}", w),
+        None => String::new(),
+    };
+
+    let mut lines = Vec::new();
+    lines.push(format!("{}{}", TAG_PREFIX, project_str));
+    lines.push(format!(
+        "{} {} run --project {} --max-parallel {}{} >> {} 2>&1 # gsd-cron:{}",
+        cron_schedule, binary_str, project_str, max_parallel, window_arg, log_file.display(), project_str
+    ));
+    lines.push(format!("{}{} END", TAG_PREFIX, project_str));
 
     let mut final_content = cleaned;
     if !final_content.is_empty() && !final_content.ends_with('\n') {
         final_content.push('\n');
     }
-    final_content.push_str(&new_entries.join("\n"));
+    final_content.push_str(&lines.join("\n"));
     final_content.push('\n');
 
     write_crontab(&final_content)
+}
+
+/// Convert an interval in minutes to a cron schedule expression.
+fn interval_to_cron(interval_minutes: u32) -> String {
+    if interval_minutes == 0 {
+        return "* * * * *".to_string();
+    }
+
+    if interval_minutes < 60 {
+        // e.g. 30m -> */30 * * * *
+        format!("*/{} * * * *", interval_minutes)
+    } else if interval_minutes % 60 == 0 {
+        let hours = interval_minutes / 60;
+        // e.g. 2h -> 0 */2 * * *
+        format!("0 */{} * * *", hours)
+    } else {
+        // Non-even hour intervals: just use minutes
+        format!("*/{} * * * *", interval_minutes)
+    }
 }
 
 /// Remove all crontab entries for a project
@@ -117,7 +119,6 @@ pub fn remove(project_path: &Path) -> Result<(), String> {
     let cleaned = remove_project_entries(&current, project_path);
 
     if cleaned.trim().is_empty() {
-        // Remove crontab entirely if nothing left
         Command::new("crontab")
             .arg("-r")
             .output()
@@ -147,7 +148,6 @@ fn remove_project_entries(crontab_content: &str, project_path: &Path) -> String 
         }
 
         if skipping {
-            // Check if this line belongs to our project (inline tag)
             if line.contains(&format!("gsd-cron:{}", project_str)) {
                 continue;
             }
@@ -161,103 +161,37 @@ fn remove_project_entries(crontab_content: &str, project_path: &Path) -> String 
     result.join("\n")
 }
 
-/// Get status of scheduled phases for a project from the current crontab
-pub fn get_scheduled_phases(project_path: &Path) -> Result<Vec<(String, String)>, String> {
-    let current = read_crontab()?;
-    let project_str = project_path.display().to_string();
-
-    let mut entries = Vec::new();
-
-    for line in current.lines() {
-        if line.contains(&format!("gsd-cron:{}", project_str))
-            && !line.starts_with('#')
-        {
-            // Parse: "M H * * * /path/wrapper.sh PHASE # gsd-cron:..."
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 7 {
-                let time = format!("{}:{}", parts[1], parts[0]);
-                let phase = parts[6].to_string();
-                entries.push((phase, time));
-            }
-        }
-    }
-
-    Ok(entries)
-}
-
-/// Format crontab entries for display (without actually installing)
-pub fn format_entries(entries: &[String]) -> String {
-    entries.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveTime;
-    use crate::parser::{Phase, PhaseNumber, PhaseSchedulability, PhaseStatus};
 
-    fn make_slot(hour: u32, min: u32, phases: Vec<(f64, &str)>) -> ScheduleSlot {
-        ScheduleSlot {
-            time: NaiveTime::from_hms_opt(hour, min, 0).unwrap(),
-            phases: phases
-                .into_iter()
-                .map(|(num, name)| Phase {
-                    number: PhaseNumber(num),
-                    name: name.to_string(),
-                    plans_complete: (0, 1),
-                    status: PhaseStatus::NotStarted,
-                    completed_date: None,
-                    schedulability: PhaseSchedulability::Schedulable,
-                    dir_path: None,
-                })
-                .collect(),
-        }
+    #[test]
+    fn test_interval_to_cron_minutes() {
+        assert_eq!(interval_to_cron(30), "*/30 * * * *");
+        assert_eq!(interval_to_cron(15), "*/15 * * * *");
+        assert_eq!(interval_to_cron(45), "*/45 * * * *");
     }
 
     #[test]
-    fn test_generate_entries() {
-        let slots = vec![
-            make_slot(9, 0, vec![(1.0, "Foundation")]),
-            make_slot(11, 0, vec![(2.0, "Auth")]),
-            make_slot(13, 0, vec![(2.1, "Hotfix A"), (2.2, "Hotfix B")]),
-            make_slot(15, 0, vec![(3.0, "API")]),
-        ];
+    fn test_interval_to_cron_hours() {
+        assert_eq!(interval_to_cron(60), "0 */1 * * *");
+        assert_eq!(interval_to_cron(120), "0 */2 * * *");
+    }
 
-        let project = Path::new("/home/user/myproject");
-        let wrapper = Path::new("/home/user/myproject/.planning/gsd-cron-wrapper.sh");
-
-        let entries = generate_entries(&slots, project, wrapper);
-
-        // First line is the tag
-        assert!(entries[0].starts_with("# gsd-cron:"));
-
-        // Check phase 1 entry
-        assert!(entries[1].contains("0 9 * * *"));
-        assert!(entries[1].contains("phase 1"));
-
-        // Check phase 2 entry
-        assert!(entries[2].contains("0 11 * * *"));
-
-        // Check parallel phases
-        assert!(entries[3].contains("0 13 * * *"));
-        assert!(entries[3].contains("phase 2.1"));
-        assert!(entries[4].contains("0 13 * * *"));
-        assert!(entries[4].contains("phase 2.2"));
-
-        // Last line is the END tag
-        assert!(entries.last().unwrap().contains("END"));
+    #[test]
+    fn test_interval_to_cron_non_even() {
+        assert_eq!(interval_to_cron(90), "*/90 * * * *");
     }
 
     #[test]
     fn test_remove_project_entries() {
         let crontab = r#"0 * * * * /some/other/job
 # gsd-cron:/home/user/project
-0 9 * * * /home/user/project/.planning/gsd-cron-wrapper.sh 1 # gsd-cron:/home/user/project phase 1
-0 11 * * * /home/user/project/.planning/gsd-cron-wrapper.sh 2 # gsd-cron:/home/user/project phase 2
+*/30 * * * * /usr/bin/gsd-cron run --project /home/user/project --max-parallel 2 >> /home/user/project/.planning/logs/dispatcher.log 2>&1 # gsd-cron:/home/user/project
 # gsd-cron:/home/user/project END
 30 * * * * /another/job"#;
 
-        let cleaned = remove_project_entries(crontab, Path::new("/home/user/project"));
+        let cleaned = remove_project_entries(crontab, std::path::Path::new("/home/user/project"));
         assert!(!cleaned.contains("gsd-cron"));
         assert!(cleaned.contains("/some/other/job"));
         assert!(cleaned.contains("/another/job"));
@@ -266,13 +200,13 @@ mod tests {
     #[test]
     fn test_remove_preserves_other_projects() {
         let crontab = r#"# gsd-cron:/project-a
-0 9 * * * /project-a/.planning/gsd-cron-wrapper.sh 1 # gsd-cron:/project-a phase 1
+*/30 * * * * /usr/bin/gsd-cron run --project /project-a --max-parallel 2 >> /project-a/.planning/logs/dispatcher.log 2>&1 # gsd-cron:/project-a
 # gsd-cron:/project-a END
 # gsd-cron:/project-b
-0 9 * * * /project-b/.planning/gsd-cron-wrapper.sh 1 # gsd-cron:/project-b phase 1
+*/30 * * * * /usr/bin/gsd-cron run --project /project-b --max-parallel 2 >> /project-b/.planning/logs/dispatcher.log 2>&1 # gsd-cron:/project-b
 # gsd-cron:/project-b END"#;
 
-        let cleaned = remove_project_entries(crontab, Path::new("/project-a"));
+        let cleaned = remove_project_entries(crontab, std::path::Path::new("/project-a"));
         assert!(!cleaned.contains("project-a"));
         assert!(cleaned.contains("project-b"));
     }

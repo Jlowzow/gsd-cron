@@ -114,10 +114,11 @@ pub fn parse_roadmap(content: &str) -> Vec<Phase> {
     let mut phases = Vec::new();
 
     // Match the progress table rows
-    // Format: | 1. Name | 0/3 | Not started | - |
-    // Or with milestone: | 1. Name | v1.0 | 0/3 | Not started | - |
+    // Format 1: | 1. Name | 0/3 | Not started | - |
+    // Format 2: | 1. Name | v1.0 | 0/3 | Not started | - |  (with milestone)
+    // Format 3: | Phase 1: Name | Status | Requirements | 100% |  (GSD v2)
     let row_re = Regex::new(
-        r"(?m)^\|\s*(\d+(?:\.\d+)?)\.\s+(.+?)\s*\|(.+)\|$"
+        r"(?m)^\|\s*(?:Phase\s+)?(\d+(?:\.\d+)?)[.:]\s+(.+?)\s*\|(.+)\|$"
     ).unwrap();
 
     for cap in row_re.captures_iter(content) {
@@ -143,6 +144,10 @@ pub fn parse_roadmap(content: &str) -> Vec<Phase> {
                 plans_complete = pc;
             } else if let Some(s) = parse_status(col) {
                 status = s;
+                // Also extract embedded date from status like "✓ Complete (2026-02-15)"
+                if completed_date.is_none() {
+                    completed_date = extract_embedded_date(col);
+                }
             } else if is_date(col) {
                 completed_date = Some(col.to_string());
             }
@@ -163,22 +168,49 @@ pub fn parse_roadmap(content: &str) -> Vec<Phase> {
 }
 
 fn parse_plans_complete(s: &str) -> Option<(u32, u32)> {
+    // Try N/M format first (e.g., "3/3", "0/2")
     let re = Regex::new(r"^(\d+)/(\d+)$").unwrap();
-    re.captures(s).map(|cap| {
+    if let Some(cap) = re.captures(s) {
         let done = cap[1].parse().unwrap_or(0);
         let total = cap[2].parse().unwrap_or(0);
-        (done, total)
-    })
+        return Some((done, total));
+    }
+
+    // Try percentage format (e.g., "100%", "0%")
+    let pct_re = Regex::new(r"^(\d+)%$").unwrap();
+    if let Some(cap) = pct_re.captures(s) {
+        let pct: u32 = cap[1].parse().unwrap_or(0);
+        return Some((pct, 100));
+    }
+
+    None
 }
 
 fn parse_status(s: &str) -> Option<PhaseStatus> {
-    match s.to_lowercase().trim() {
-        "not started" => Some(PhaseStatus::NotStarted),
+    let lower = s.to_lowercase();
+    let trimmed = lower.trim();
+    match trimmed {
+        "not started" | "pending" => Some(PhaseStatus::NotStarted),
         "in progress" => Some(PhaseStatus::InProgress),
         "complete" => Some(PhaseStatus::Complete),
         "deferred" => Some(PhaseStatus::Deferred),
-        _ => None,
+        _ => {
+            // Handle "✓ Complete (date)" or similar patterns
+            if trimmed.contains("complete") {
+                return Some(PhaseStatus::Complete);
+            }
+            if trimmed.contains("in progress") {
+                return Some(PhaseStatus::InProgress);
+            }
+            None
+        }
     }
+}
+
+/// Extract an embedded date from a string like "✓ Complete (2026-02-15)"
+fn extract_embedded_date(s: &str) -> Option<String> {
+    let re = Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap();
+    re.find(s).map(|m| m.as_str().to_string())
 }
 
 fn is_date(s: &str) -> bool {
@@ -418,6 +450,90 @@ mod tests {
         assert_eq!(phases.len(), 2);
         assert_eq!(phases[0].plans_complete, (3, 3));
         assert_eq!(phases[0].status, PhaseStatus::Complete);
+    }
+
+    #[test]
+    fn test_parse_roadmap_gsd_v2_format() {
+        let content = r#"
+## Progress
+
+| Phase | Status | Requirements | Completion |
+|-------|--------|--------------|------------|
+| Phase 1: Foundation & Multi-Tenant Architecture | ✓ Complete (2026-02-15) | TENANT-01, TENANT-02 | 100% |
+| Phase 2: Core Storage & Database Layer | Pending | DEPLOY-01, DEPLOY-02 | 0% |
+| Phase 3: Document Ingestion Pipeline | Pending | INGEST-01, INGEST-02 | 0% |
+| Phase 11: Production Hardening & Scale Testing | Pending | (Production readiness) | 0% |
+"#;
+        let phases = parse_roadmap(content);
+        assert_eq!(phases.len(), 4, "Expected 4 phases, got {}: {:?}", phases.len(), phases.iter().map(|p| &p.name).collect::<Vec<_>>());
+
+        // Phase 1: complete with date
+        assert_eq!(phases[0].number.display(), "1");
+        assert_eq!(phases[0].name, "Foundation & Multi-Tenant Architecture");
+        assert_eq!(phases[0].status, PhaseStatus::Complete);
+        assert_eq!(phases[0].completed_date, Some("2026-02-15".to_string()));
+        assert_eq!(phases[0].plans_complete, (100, 100));
+
+        // Phase 2: pending
+        assert_eq!(phases[1].number.display(), "2");
+        assert_eq!(phases[1].name, "Core Storage & Database Layer");
+        assert_eq!(phases[1].status, PhaseStatus::NotStarted);
+        assert_eq!(phases[1].plans_complete, (0, 100));
+
+        // Phase 11: double-digit phase number
+        assert_eq!(phases[3].number.display(), "11");
+        assert_eq!(phases[3].name, "Production Hardening & Scale Testing");
+    }
+
+    #[test]
+    fn test_parse_roadmap_full_ragbrain() {
+        // Full 11-phase roadmap like RAGbrain produces
+        let content = r#"
+## Progress
+
+| Phase | Status | Requirements | Completion |
+|-------|--------|--------------|------------|
+| Phase 1: Foundation & Multi-Tenant Architecture | ✓ Complete (2026-02-15) | TENANT-01, TENANT-02, TENANT-03, TENANT-04, TENANT-05, TENANT-07, TENANT-08, TENANT-09 | 100% |
+| Phase 2: Core Storage & Database Layer | Pending | DEPLOY-01, DEPLOY-02, DEPLOY-03 | 0% |
+| Phase 3: Document Ingestion Pipeline | Pending | INGEST-01, INGEST-02, INGEST-03, INGEST-04, INGEST-05, INGEST-06 | 0% |
+| Phase 4: Directory Ingestion & Watching | Pending | INGEST-07, INGEST-08 | 0% |
+| Phase 5: Hybrid Retrieval & Search | Pending | RETR-01, RETR-02, RETR-04, TENANT-06 | 0% |
+| Phase 6: LLM Integration & Answer Generation | Pending | LLM-01, LLM-02, LLM-03, LLM-04, LLM-05, RETR-03 | 0% |
+| Phase 7: Semantic Caching & Performance Optimization | Pending | RETR-05, RETR-06 | 0% |
+| Phase 8: REST API & Authentication | Pending | API-01, API-02, API-03, API-04, API-05 | 0% |
+| Phase 9: External Integrations | Pending | API-06, API-07 | 0% |
+| Phase 10: Observability & Debugging | Pending | OBS-01, OBS-02, OBS-03, OBS-04 | 0% |
+| Phase 11: Production Hardening & Scale Testing | Pending | (Production readiness) | 0% |
+"#;
+        let phases = parse_roadmap(content);
+        assert_eq!(phases.len(), 11, "Expected 11 phases, got {}", phases.len());
+    }
+
+    #[test]
+    fn test_parse_status_variants() {
+        assert_eq!(parse_status("Pending"), Some(PhaseStatus::NotStarted));
+        assert_eq!(parse_status("pending"), Some(PhaseStatus::NotStarted));
+        assert_eq!(parse_status("Not started"), Some(PhaseStatus::NotStarted));
+        assert_eq!(parse_status("In progress"), Some(PhaseStatus::InProgress));
+        assert_eq!(parse_status("Complete"), Some(PhaseStatus::Complete));
+        assert_eq!(parse_status("✓ Complete (2026-02-15)"), Some(PhaseStatus::Complete));
+        assert_eq!(parse_status("Deferred"), Some(PhaseStatus::Deferred));
+    }
+
+    #[test]
+    fn test_extract_embedded_date() {
+        assert_eq!(extract_embedded_date("✓ Complete (2026-02-15)"), Some("2026-02-15".to_string()));
+        assert_eq!(extract_embedded_date("Complete"), None);
+        assert_eq!(extract_embedded_date("Pending"), None);
+    }
+
+    #[test]
+    fn test_parse_plans_complete_percentage() {
+        assert_eq!(parse_plans_complete("100%"), Some((100, 100)));
+        assert_eq!(parse_plans_complete("0%"), Some((0, 100)));
+        assert_eq!(parse_plans_complete("50%"), Some((50, 100)));
+        assert_eq!(parse_plans_complete("3/3"), Some((3, 3)));
+        assert_eq!(parse_plans_complete("0/2"), Some((0, 2)));
     }
 
     #[test]
