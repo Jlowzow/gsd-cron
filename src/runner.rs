@@ -28,6 +28,38 @@ pub struct ClaudeResult {
     pub cost_usd: f64,
 }
 
+/// Resolve the absolute path to the `claude` CLI binary.
+/// Checks common install locations so cron jobs work without PATH setup.
+fn resolve_claude_binary() -> Result<PathBuf, String> {
+    // First try PATH-based lookup
+    if let Ok(output) = Command::new("which").arg("claude").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
+    // Fall back to common install locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{}/.local/bin/claude", home),
+        format!("{}/.cargo/bin/claude", home),
+        "/usr/local/bin/claude".to_string(),
+        "/usr/bin/claude".to_string(),
+    ];
+
+    for candidate in &candidates {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    Err("Could not find 'claude' binary. Install it or add it to PATH.".to_string())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct UsageLedger {
     pub entries: Vec<UsageEntry>,
@@ -216,6 +248,17 @@ pub fn run(project: &Path, max_parallel: usize, window: Option<&str>, weekly_bud
         }
     }
 
+    let claude_bin = match resolve_claude_binary() {
+        Ok(p) => {
+            eprintln!("Using claude binary: {}", p.display());
+            p
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return;
+        }
+    };
+
     let _lock = match acquire_lock(project) {
         Some(l) => l,
         None => {
@@ -284,7 +327,7 @@ pub fn run(project: &Path, max_parallel: usize, window: Option<&str>, weekly_bud
                 .join(", ")
         );
 
-        let outcomes = execute_batch(&batch, project, &logs_dir);
+        let outcomes = execute_batch(&batch, project, &logs_dir, &claude_bin);
 
         let mut any_verified = false;
         for (phase, outcome) in &outcomes {
@@ -417,6 +460,7 @@ fn execute_batch(
     batch: &[(Phase, PhaseAction)],
     project: &Path,
     logs_dir: &Path,
+    claude_bin: &Path,
 ) -> Vec<(Phase, PhaseOutcome)> {
     let results: Arc<Mutex<Vec<(Phase, PhaseOutcome)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -427,9 +471,10 @@ fn execute_batch(
         let project = project.to_path_buf();
         let log_file = logs_dir.join(format!("phase-{}.log", phase.number.display()));
         let results = Arc::clone(&results);
+        let claude_bin = claude_bin.to_path_buf();
 
         let handle = std::thread::spawn(move || {
-            let outcome = run_phase_lifecycle(&phase, &action, &project, &log_file);
+            let outcome = run_phase_lifecycle(&phase, &action, &project, &log_file, &claude_bin);
             results.lock().unwrap().push((phase, outcome));
         });
 
@@ -449,6 +494,7 @@ fn run_phase_lifecycle(
     action: &PhaseAction,
     project: &Path,
     log_file: &Path,
+    claude_bin: &Path,
 ) -> PhaseOutcome {
     let phase_display = phase.number.display();
 
@@ -460,7 +506,7 @@ fn run_phase_lifecycle(
             );
 
             let prompt = format!("/gsd:plan-phase {}", phase_display);
-            let result = run_claude(&prompt, project, log_file);
+            let result = run_claude(claude_bin, &prompt, project, log_file);
             record_cost(project, &phase_display, "plan", result.cost_usd);
             if !result.success {
                 log_to_file(
@@ -477,7 +523,7 @@ fn run_phase_lifecycle(
             );
 
             let prompt = format!("/gsd:execute-phase {}", phase_display);
-            let result = run_claude(&prompt, project, log_file);
+            let result = run_claude(claude_bin, &prompt, project, log_file);
             record_cost(project, &phase_display, "execute", result.cost_usd);
             if !result.success {
                 log_to_file(
@@ -496,7 +542,7 @@ fn run_phase_lifecycle(
     );
 
     let verify_prompt = format!("/gsd:verify-work {}", phase_display);
-    let verify_result = run_claude(&verify_prompt, project, log_file);
+    let verify_result = run_claude(claude_bin, &verify_prompt, project, log_file);
     record_cost(project, &phase_display, "verify", verify_result.cost_usd);
     if !verify_result.success {
         log_to_file(
@@ -549,26 +595,26 @@ fn parse_cost_from_output(stdout: &str) -> f64 {
 
 /// Run claude CLI with the given prompt and project, appending output to log file.
 /// Returns a ClaudeResult with success status and cost extracted from JSON output.
-fn run_claude(prompt: &str, project: &Path, log_file: &Path) -> ClaudeResult {
+fn run_claude(claude_bin: &Path, prompt: &str, project: &Path, log_file: &Path) -> ClaudeResult {
     let project_str = project.display().to_string();
 
     log_to_file(
         log_file,
         &format!(
-            "Running: claude --dangerously-skip-permissions --output-format json -p '{}' {}",
-            prompt, project_str
+            "Running: {} --dangerously-skip-permissions --output-format json -p '{}' (cwd: {})",
+            claude_bin.display(), prompt, project_str
         ),
     );
 
-    let result = Command::new("claude")
+    let result = Command::new(claude_bin)
         .args([
             "--dangerously-skip-permissions",
             "--output-format",
             "json",
             "-p",
             prompt,
-            &project_str,
         ])
+        .current_dir(project)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output();
